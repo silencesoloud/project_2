@@ -1,0 +1,236 @@
+using System;
+using System.Diagnostics;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+
+namespace Lab02
+{
+    class Program
+    {
+        const int N = 1024;
+        const int UNROLL = 4;
+
+        private const int CblasRowMajor = 101;
+        private const int CblasNoTrans = 111;
+
+        [DllImport("libopenblas", CallingConvention = CallingConvention.Cdecl)]
+        private static extern void cblas_zgemm(
+            int Order, int TransA, int TransB, int M, int N, int K,
+            IntPtr alpha, IntPtr A, int lda, IntPtr B, int ldb,
+            IntPtr beta, IntPtr C, int ldc);
+
+        static void Main()
+        {
+            Console.WriteLine($"Размер матриц: {N}x{N}");
+            long operations = 2L * N * N * N;
+
+            Console.WriteLine("Генерация матриц...");
+            Complex[][] A = GenerateMatrix(N);
+            Complex[][] B = GenerateMatrix(N);
+            Complex[][] Bt = Transpose(B);
+            Console.WriteLine("Готово.");
+
+            // --- Вариант 1: Классический ---
+            Console.WriteLine("--- ВАРИАНТ 1: Классический алгоритм ---");
+            Complex[][] C1 = new Complex[N][];
+            for (int i = 0; i < N; i++) C1[i] = new Complex[N];
+            double t1 = Measure(() => ClassicMultiply(A, B, C1));
+            double p1 = MFlops(operations, t1);
+            Console.WriteLine($"Время: {t1:F4} сек | {p1:F2} MFlops");
+
+            // --- Вариант 2: OpenBLAS ---
+            Console.WriteLine("--- ВАРИАНТ 2: OpenBLAS ---");
+            Complex[][] C2 = new Complex[N][];
+            for (int i = 0; i < N; i++) C2[i] = new Complex[N];
+            double t2 = Measure(() =>
+            {
+                var temp = OpenBlasMultiply(A, B);
+                for (int i = 0; i < N; i++)
+                    Array.Copy(temp[i], C2[i], N);
+            });
+            double p2 = MFlops(operations, t2);
+            Console.WriteLine($"Время: {t2:F4} сек | {p2:F2} MFlops");
+
+            // --- Вариант 3: Оптимизированный ---
+            Console.WriteLine("--- ВАРИАНТ 3: Оптимизированный ---");
+            Complex[][] C3 = new Complex[N][];
+            for (int i = 0; i < N; i++) C3[i] = new Complex[N];
+            double t3 = Measure(() => OptimizedMultiply(A, Bt, C3));
+            double p3 = MFlops(operations, t3);
+            Console.WriteLine($"Время: {t3:F4} сек | {p3:F2} MFlops");
+            Console.WriteLine($"Относительно OpenBLAS: {p3 / p2 * 100:F1}%");
+
+            // --- Проверка ---
+            Console.WriteLine("--- Проверка корректности ---");
+            Console.WriteLine($"Классический == OpenBLAS: {(Verify(C1, C2) ? "OK" : "ОШИБКА")}");
+            Console.WriteLine($"Классический == Оптимизированный: {(Verify(C1, C3) ? "OK" : "ОШИБКА")}");
+
+            Console.WriteLine("Нажмите любую клавишу...");
+            Console.ReadKey();
+        }
+
+        static void OptimizedMultiply(Complex[][] A, Complex[][] Bt, Complex[][] C)
+        {
+            int n = N;
+            for (int i = 0; i < n; i++)
+                Array.Clear(C[i], 0, n);
+
+            Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, i =>
+            {
+                Complex[] rowA = A[i], rowC = C[i];
+                for (int j = 0; j < n; j++)
+                {
+                    Complex[] colB = Bt[j];
+                    double sr = 0, si = 0;
+                    int k = 0;
+
+                    for (; k <= n - UNROLL; k += UNROLL)
+                    {
+                        double ar0 = rowA[k].Real, ai0 = rowA[k].Imaginary;
+                        double br0 = colB[k].Real, bi0 = colB[k].Imaginary;
+                        sr += ar0 * br0 - ai0 * bi0;
+                        si += ar0 * bi0 + ai0 * br0;
+
+                        double ar1 = rowA[k + 1].Real, ai1 = rowA[k + 1].Imaginary;
+                        double br1 = colB[k + 1].Real, bi1 = colB[k + 1].Imaginary;
+                        sr += ar1 * br1 - ai1 * bi1;
+                        si += ar1 * bi1 + ai1 * br1;
+
+                        double ar2 = rowA[k + 2].Real, ai2 = rowA[k + 2].Imaginary;
+                        double br2 = colB[k + 2].Real, bi2 = colB[k + 2].Imaginary;
+                        sr += ar2 * br2 - ai2 * bi2;
+                        si += ar2 * bi2 + ai2 * br2;
+
+                        double ar3 = rowA[k + 3].Real, ai3 = rowA[k + 3].Imaginary;
+                        double br3 = colB[k + 3].Real, bi3 = colB[k + 3].Imaginary;
+                        sr += ar3 * br3 - ai3 * bi3;
+                        si += ar3 * bi3 + ai3 * br3;
+                    }
+                    for (; k < n; k++)
+                    {
+                        double ar = rowA[k].Real, ai = rowA[k].Imaginary;
+                        double br = colB[k].Real, bi = colB[k].Imaginary;
+                        sr += ar * br - ai * bi;
+                        si += ar * bi + ai * br;
+                    }
+                    rowC[j] = new Complex(sr, si);
+                }
+            });
+        }
+
+        static Complex[][] OpenBlasMultiply(Complex[][] A, Complex[][] B)
+        {
+            int n = N;
+            Complex[] flatA = Flatten(A), flatB = Flatten(B), flatC = new Complex[n * n];
+            Complex alpha = new(1, 0), beta = new(0, 0);
+
+            GCHandle hA = GCHandle.Alloc(flatA, GCHandleType.Pinned);
+            GCHandle hB = GCHandle.Alloc(flatB, GCHandleType.Pinned);
+            GCHandle hC = GCHandle.Alloc(flatC, GCHandleType.Pinned);
+            GCHandle hAlpha = GCHandle.Alloc(alpha, GCHandleType.Pinned);
+            GCHandle hBeta = GCHandle.Alloc(beta, GCHandleType.Pinned);
+
+            try
+            {
+                cblas_zgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    n, n, n, hAlpha.AddrOfPinnedObject(), hA.AddrOfPinnedObject(), n,
+                    hB.AddrOfPinnedObject(), n, hBeta.AddrOfPinnedObject(),
+                    hC.AddrOfPinnedObject(), n);
+            }
+            finally
+            {
+                hA.Free(); hB.Free(); hC.Free(); hAlpha.Free(); hBeta.Free();
+            }
+            return Unflatten(flatC);
+        }
+
+        static void ClassicMultiply(Complex[][] A, Complex[][] B, Complex[][] C)
+        {
+            int n = N;
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    C[i][j] = Complex.Zero;
+
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    Complex sum = Complex.Zero;
+                    for (int k = 0; k < n; k++)
+                        sum += A[i][k] * B[k][j];
+                    C[i][j] = sum;
+                }
+        }
+
+        static Complex[][] GenerateMatrix(int n)
+        {
+            var rnd = new Random(42);
+            var m = new Complex[n][];
+            for (int i = 0; i < n; i++)
+            {
+                m[i] = new Complex[n];
+                for (int j = 0; j < n; j++)
+                    m[i][j] = new Complex(rnd.NextDouble() * 10, rnd.NextDouble() * 10);
+            }
+            return m;
+        }
+
+        static Complex[][] Transpose(Complex[][] m)
+        {
+            int n = m.Length;
+            var t = new Complex[n][];
+            for (int i = 0; i < n; i++)
+            {
+                t[i] = new Complex[n];
+                for (int j = 0; j < n; j++) t[i][j] = m[j][i];
+            }
+            return t;
+        }
+
+        static Complex[] Flatten(Complex[][] m)
+        {
+            int n = m.Length;
+            Complex[] f = new Complex[n * n];
+            int idx = 0;
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    f[idx++] = m[i][j];
+            return f;
+        }
+
+        static Complex[][] Unflatten(Complex[] f)
+        {
+            int n = N;
+            var m = new Complex[n][];
+            int idx = 0;
+            for (int i = 0; i < n; i++)
+            {
+                m[i] = new Complex[n];
+                for (int j = 0; j < n; j++) m[i][j] = f[idx++];
+            }
+            return m;
+        }
+
+        static double Measure(Action action, int runs = 3)
+        {
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < runs; i++) action();
+            return sw.Elapsed.TotalSeconds / runs;
+        }
+
+        static double MFlops(long ops, double t) => ops / t / 1e6;
+
+        static bool Verify(Complex[][] A, Complex[][] B, double eps = 1e-3)
+        {
+            for (int i = 0; i < N; i++)
+                for (int j = 0; j < N; j++)
+                {
+                    double diff = Complex.Abs(A[i][j] - B[i][j]);
+                    double maxVal = Math.Max(Complex.Abs(A[i][j]), Complex.Abs(B[i][j]));
+                    if (diff > eps && diff > eps * maxVal) return false;
+                }
+            return true;
+        }
+    }
+}
